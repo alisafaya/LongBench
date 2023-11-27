@@ -49,7 +49,7 @@ def scorer_e(dataset, predictions, answers, lengths, all_classes):
     scores = {"0-4k": [], "4-8k": [], "8k+": []}
     for (prediction, ground_truths, length) in zip(predictions, answers, lengths):
         score = 0.
-        if dataset in ["trec", "triviaqa", "samsum", "lsht"]:
+        if dataset in ["trec", "triviaqa", "samsum", "lsht", "hotpotqa"]:
             prediction = prediction.lstrip('\n').split('\n')[0]
         for ground_truth in ground_truths:
             score = max(score, dataset2metric[dataset](prediction, ground_truth, all_classes=all_classes))
@@ -67,7 +67,7 @@ def scorer(dataset, predictions, answers, all_classes):
     total_score = 0.
     for (prediction, ground_truths) in zip(predictions, answers):
         score = 0.
-        if dataset in ["trec", "triviaqa", "samsum", "lsht"]:
+        if dataset in ["trec", "triviaqa", "samsum", "lsht", "hotpotqa"]:
             prediction = prediction.lstrip('\n').split('\n')[0]
         for ground_truth in ground_truths:
             score = max(score, dataset2metric[dataset](prediction, ground_truth, all_classes=all_classes))
