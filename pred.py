@@ -8,7 +8,7 @@ import torch
 import numpy as np
 from datasets import load_dataset
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -18,6 +18,7 @@ def parse_args():
     parser.add_argument("--model", type=str, required=True, help="Model name")
     parser.add_argument("--e", action="store_true", help="Evaluate on LongBench-E")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
+    parser.add_argument("--datasets", nargs="+", type=str, default=None, help="Datasets to predict on")
     return parser.parse_args()
 
 def seed_everything(seed=42):
@@ -29,8 +30,12 @@ def seed_everything(seed=42):
 
 def load_model_and_tokenizer(path, device):
     try:
-        tokenizer = AutoTokenizer.from_pretrained(path, padding_side="left")
-        model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=torch.bfloat16).to(device)
+        config = AutoConfig.from_pretrained(path)
+        config.use_cache = True
+        config._flash_attn_2_enabled = True
+        tokenizer = AutoTokenizer.from_pretrained(path, padding_side="left", use_fast=False)
+        # fp32 gives consistent results: https://github.com/huggingface/transformers/issues/25921
+        model = AutoModelForCausalLM.from_pretrained(path, config=config, torch_dtype=torch.float32).to(device) 
         model.eval()
         logging.info("Model and tokenizer loaded successfully.")
         return model, tokenizer
@@ -64,22 +69,21 @@ def prepare_prompts(tokenizer, json_obj, max_length, prompt_format, dataset, mod
 def generate_predictions(model, prompts, max_gen, tokenizer):
     preds = []
     try:
-        if max_gen < 128:
+        if max_gen < -1:
             eos_token_id = [tokenizer.eos_token_id, tokenizer.encode("\n", add_special_tokens=False)[-1]]
         else:
             eos_token_id = tokenizer.eos_token_id
 
         context_length = prompts.input_ids.shape[-1]
         with torch.no_grad():
-            with torch.cuda.amp.autocast():
-                output = model.generate(
-                    **prompts,
-                    max_new_tokens=max_gen,
-                    min_new_tokens=1,
-                    eos_token_id=eos_token_id,
-                    num_beams=1,
-                    do_sample=False,
-                )
+            output = model.generate(
+                **prompts,
+                max_new_tokens=max_gen,
+                min_new_tokens=1,
+                eos_token_id=eos_token_id,
+                num_beams=1,
+                do_sample=False,
+            )
 
         preds = tokenizer.batch_decode(output[:, context_length:].cpu(), skip_special_tokens=True)
         return preds
@@ -91,32 +95,42 @@ def predict_dataset(model, tokenizer, data, max_length, max_gen, prompt_format, 
 
     prompts = []
     for json_obj in tqdm(data, desc=f"Preparing inputs for {dataset}"):
-        prompt = prepare_prompts(tokenizer, json_obj, max_length, prompt_format, dataset, model_name)
+        prompt = prepare_prompts(tokenizer, json_obj, max_length - max_gen, prompt_format, dataset, model_name)
         if prompt is not None:
             prompts.append(prompt)
 
-    # sort prompts by length to reduce padding. in ascending order 
+    # sort prompts by length to reduce padding. in descending order 
     # save indices for resorting later
-    sorted_indices = np.argsort([len(prompt) for prompt in prompts])
+    sorted_indices = np.argsort([len(prompt) for prompt in prompts])[::-1]
     prompts = [prompts[i] for i in sorted_indices]
 
     # generate predictions in batches
     preds = []
+    input_ids = []
+    attn_masks = []
+
     for i in tqdm(range(0, len(prompts), batch_size), desc=f"Generating predictions for {dataset}"):
         batch = prompts[i:i + batch_size]
-        prepared_input = tokenizer(batch, padding=True, truncation=True, max_length=max_length, return_tensors="pt").to(device)
+        prepared_input = tokenizer(batch, padding=True, truncation=True, 
+                                   max_length=max_length - max_gen, return_tensors="pt").to(device)
         preds.extend(generate_predictions(model, prepared_input, max_gen, tokenizer))
+        input_ids.extend(prepared_input.input_ids.tolist())
+        attn_masks.extend(prepared_input.attention_mask.tolist())
 
     # resort predictions
     preds = [preds[i] for i in np.argsort(sorted_indices)]
+    input_ids = [input_ids[i] for i in np.argsort(sorted_indices)]
+    attn_masks = [attn_masks[i] for i in np.argsort(sorted_indices)]
 
     json_preds = []
-    for json_obj, pred in zip(data, preds):
+    for i, (json_obj, pred) in enumerate(zip(data, preds)):
         json_preds.append({
             "pred": pred,
             "answers": json_obj["answers"],
             "all_classes": json_obj["all_classes"],
             "length": json_obj["length"],
+            "input_ids": input_ids[i],
+            "attention_mask": attn_masks[i],
         })
 
     return json_preds
@@ -145,12 +159,17 @@ def main():
     model, tokenizer = load_model_and_tokenizer(model2path[model_name], device)
     max_length = model2maxlen[model_name]
 
-    datasets = ["qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", \
+    if args.datasets is not None:
+        datasets = args.datasets
+    else:
+        datasets = ["qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", \
                 "gov_report", "multi_news", "trec", "triviaqa", "samsum",\
                 "passage_count", "passage_retrieval_en", "lcc", "repobench-p"]
 
     if not args.e:
-        datasets.extend(["narrativeqa", "musique", "qmsum"])
+        if args.datasets is None:
+            datasets.extend(["narrativeqa", "musique", "qmsum"])
+
         output_dir = "pred"
         logging.info("Evaluating on LongBench")
     else:

@@ -25,7 +25,6 @@ dataset2metric = {
     "trec": classification_score,
     "triviaqa": qa_f1_score,
     "samsum": rouge_score,
-    "lsht": classification_score,
     "passage_retrieval_en": retrieval_score,
     "passage_count": count_score,
     "lcc": code_sim_score,
@@ -34,8 +33,8 @@ dataset2metric = {
 
 oneliners = ["narrativeqa", "qasper", "multifieldqa_en", 
              "hotpotqa", "2wikimqa", "musique", "trec", 
-             "triviaqa", "samsum", "lsht", "passage_count",
-             "passage_retrieval_en", "lcc", "repobench-p"]
+             "triviaqa", "samsum", "passage_count", 
+             "passage_retrieval_en"]
 
 def parse_args():
     parser = argparse.ArgumentParser()
