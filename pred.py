@@ -10,6 +10,8 @@ from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 
+from neurocache_utils import initialize_neurocache_model, prefill_neurocache
+
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -19,6 +21,29 @@ def parse_args():
     parser.add_argument("--e", action="store_true", help="Evaluate on LongBench-E")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
     parser.add_argument("--datasets", nargs="+", type=str, default=None, help="Datasets to predict on")
+    parser.add_argument("--max_length", type=int, default=None, help="Maximum length of input sequence")
+
+    # Neurocache arguments
+    parser.add_argument("--pretrained_neurocache", type=str, default=None)
+    parser.add_argument("--attention_layers", type=str, default=None)
+    parser.add_argument("--cache_layers", type=str, default=None)
+    parser.add_argument("--cache_size", type=int, default=None)
+    parser.add_argument("--cache_type", type=str, default=None, choices=["FIFO", "LRU"])
+    parser.add_argument(
+        "--cache_dtype", type=str, default=None, choices=["float16", "bfloat16", "float32"]
+    )
+    parser.add_argument("--context_size", type=int, default=None)
+    parser.add_argument("--neighborhood_size", type=int, default=None)
+    parser.add_argument("--topk", type=int, default=None)
+    parser.add_argument("--segment_size", type=int, default=1024)
+
+    # LoRA arguments
+    parser.add_argument("--add_lora", action="store_true")
+    parser.add_argument("--lora_r", type=int, default=16)
+    parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--lora_dropout", type=float, default=0.1)
+    parser.add_argument("--lora_modules", type=str, default="gate_proj,up_proj,down_proj")
+
     return parser.parse_args()
 
 def seed_everything(seed=42):
@@ -28,14 +53,24 @@ def seed_everything(seed=42):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
 
-def load_model_and_tokenizer(path, device):
+def load_model_and_tokenizer(path, device, args):
     try:
         config = AutoConfig.from_pretrained(path)
         config.use_cache = True
-        config._flash_attn_2_enabled = True
+        config._flash_attn_2_enabled = False # fp32 does not support flash_attn
         tokenizer = AutoTokenizer.from_pretrained(path, padding_side="left", use_fast=False)
+
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
         # fp32 gives consistent results: https://github.com/huggingface/transformers/issues/25921
-        model = AutoModelForCausalLM.from_pretrained(path, config=config, torch_dtype=torch.float32).to(device) 
+        if args.pretrained_neurocache:
+            logging.info("Loading model with pretrained neurocache...")
+            model = initialize_neurocache_model(args, device)
+        else:
+            logging.info("Loading model without neurocache...")
+            model = AutoModelForCausalLM.from_pretrained(path, config=config, torch_dtype=torch.float32).to(device) 
+    
         model.eval()
         logging.info("Model and tokenizer loaded successfully.")
         return model, tokenizer
@@ -67,14 +102,13 @@ def prepare_prompts(tokenizer, json_obj, max_length, prompt_format, dataset, mod
         return None
 
 def generate_predictions(model, prompts, max_gen, tokenizer):
-    preds = []
     try:
         if max_gen < -1:
             eos_token_id = [tokenizer.eos_token_id, tokenizer.encode("\n", add_special_tokens=False)[-1]]
         else:
             eos_token_id = tokenizer.eos_token_id
 
-        context_length = prompts.input_ids.shape[-1]
+        context_length = prompts["input_ids"].shape[-1]
         with torch.no_grad():
             output = model.generate(
                 **prompts,
@@ -89,13 +123,17 @@ def generate_predictions(model, prompts, max_gen, tokenizer):
         return preds
     except Exception as e:
         logging.error(f"Error in generate_predictions: {e}")
-        return None
+        raise e
 
-def predict_dataset(model, tokenizer, data, max_length, max_gen, prompt_format, dataset, device, model_name, batch_size=4):
+def predict_dataset(args, model, tokenizer, data, max_length, max_gen, prompt_format, dataset, device, model_name, batch_size=4):
+
+    token_length = max_length
+    if args.pretrained_neurocache:
+        token_length += model.neurocache_config.cache_size
 
     prompts = []
     for json_obj in tqdm(data, desc=f"Preparing inputs for {dataset}"):
-        prompt = prepare_prompts(tokenizer, json_obj, max_length - max_gen, prompt_format, dataset, model_name)
+        prompt = prepare_prompts(tokenizer, json_obj, token_length, prompt_format, dataset, model_name)
         if prompt is not None:
             prompts.append(prompt)
 
@@ -111,11 +149,25 @@ def predict_dataset(model, tokenizer, data, max_length, max_gen, prompt_format, 
 
     for i in tqdm(range(0, len(prompts), batch_size), desc=f"Generating predictions for {dataset}"):
         batch = prompts[i:i + batch_size]
+
+        # pad batch. ensure equal batchsize to avoid neurocache reinitialization of cache
+        if i + batch_size > len(prompts):
+            batch.extend([batch[-1]] * (batch_size - len(batch)))
+
         prepared_input = tokenizer(batch, padding=True, truncation=True, 
-                                   max_length=max_length - max_gen, return_tensors="pt").to(device)
-        preds.extend(generate_predictions(model, prepared_input, max_gen, tokenizer))
-        input_ids.extend(prepared_input.input_ids.tolist())
-        attn_masks.extend(prepared_input.attention_mask.tolist())
+                                    max_length=(token_length - max_gen), return_tensors="pt").to(device)
+
+        # prefill cache
+        if args.pretrained_neurocache:
+            prepared_input = prefill_neurocache(args, model, prepared_input, max_length - max_gen)
+            with model.generation_mode():
+                preds.extend(generate_predictions(model, prepared_input, max_gen, tokenizer))
+            import ipdb; ipdb.set_trace()
+        else:
+            preds.extend(generate_predictions(model, prepared_input, max_gen, tokenizer))
+
+        input_ids.extend(prepared_input["input_ids"].tolist())
+        attn_masks.extend(prepared_input["attention_mask"].tolist())
 
     # resort predictions
     preds = [preds[i] for i in np.argsort(sorted_indices)]
@@ -143,10 +195,6 @@ def main():
 
     # Load configurations
     try:
-        with open("config/model2path.json") as f:
-            model2path = json.load(f)
-        with open("config/model2maxlen.json") as f:
-            model2maxlen = json.load(f)
         with open("config/dataset2prompt.json") as f:
             dataset2prompt = json.load(f)
         with open("config/dataset2maxlen.json") as f:
@@ -156,8 +204,8 @@ def main():
         raise
 
     model_name = args.model
-    model, tokenizer = load_model_and_tokenizer(model2path[model_name], device)
-    max_length = model2maxlen[model_name]
+    model, tokenizer = load_model_and_tokenizer(model_name, device, args)
+    max_length = (model.config.max_position_embeddings - 2) if args.max_length is None else args.max_length
 
     if args.datasets is not None:
         datasets = args.datasets
@@ -179,6 +227,8 @@ def main():
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
+    model_name = model_name.replace("/", "_")
+
     for dataset in datasets:
         dataset_output_dir = os.path.join(output_dir, model_name)
         if not os.path.exists(dataset_output_dir):
@@ -192,6 +242,7 @@ def main():
 
         logging.info(f"Predicting on dataset: {dataset}")
         preds = predict_dataset(
+            args,
             model,
             tokenizer,
             data,

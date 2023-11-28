@@ -49,6 +49,9 @@ def scorer_e(dataset, predictions, answers, lengths, all_classes):
         score = 0.0
         if dataset in oneliners:
             prediction = prediction.lstrip("\n").split("\n")[0]
+        else:
+            prediction = prediction.lstrip("\n").split("\n\n")[0]
+
         for ground_truth in ground_truths:
             score = max(
                 score,
@@ -73,6 +76,9 @@ def scorer(dataset, predictions, answers, all_classes):
         score = 0.0
         if dataset in oneliners:
             prediction = prediction.lstrip("\n").split("\n")[0]
+        else:
+            prediction = prediction.lstrip("\n").split("\n\n")[0]
+
         for ground_truth in ground_truths:
             score = max(
                 score,
