@@ -49,7 +49,7 @@ def initialize_neurocache_model(args, device):
         model, args.pretrained_neurocache, config=neurocache_config
     )
     logging.info(f"Neurocache model initialized.")
-    logging.info(f"Neurocache config: {model.config}")
+    logging.info(f"Neurocache config: {model.neurocache_config}")
 
     return model.to(device)
 
@@ -57,13 +57,22 @@ def initialize_neurocache_model(args, device):
 def prefill_neurocache(args, model, inputs, last_chunk_len):
     # Pre-fill neurocache
 
-    # First, we segment the input into chunks of size args.max_length
+    # First, we segment the input into chunks of size args.segment_size
     # Then, we run the model on each chunk to fill the neurocache
     # Except for the last chunk, which is run in generation mode.
     last_chunk = {k: v[:, -last_chunk_len:] for k, v in inputs.items()}
-    inputs = {k: v[:, :-last_chunk_len] for k, v in inputs.items()}
-    segments = segment_inputs(args, inputs)
 
+    if last_chunk_len > len(inputs["input_ids"][0]):
+        # If the input is shorter than args.max_length,
+        # we don't need to pre-fill the neurocache
+        return last_chunk
+
+    if last_chunk_len > 0:
+        inputs = {k: v[:, :-last_chunk_len] for k, v in inputs.items()}
+    else:
+        last_chunk = None
+
+    segments = segment_inputs(args, inputs)
     for i, seg in enumerate(segments):
         # reset the cache at the beginning of each document
         sos = (
@@ -83,9 +92,14 @@ def segment_inputs(args, inputs):
     # with the same keys as inputs.
     def split(tensor, size):
         residual = tensor.shape[1] % size
-        segments = torch.split(tensor[:, residual:], size, dim=1)
-        if residual > 0:
-            segments = (tensor[:, :residual],) + segments
+
+        segments = ()
+        if residual > 2:
+            segments += (tensor[:, :residual],)
+
+        if tensor.shape[1] > residual:
+            segments += torch.split(tensor[:, residual:], size, dim=1)
+
         return segments
 
     segments = {}

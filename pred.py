@@ -89,8 +89,8 @@ def prepare_prompts(tokenizer, json_obj, max_length, prompt_format, dataset, mod
         tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
 
         if len(tokenized_prompt) > max_length:
-            half = int(max_length / 2)
-            prompt = tokenizer.decode(tokenized_prompt[:half], skip_special_tokens=True) + \
+            half = int(max_length / 2) - 8 # -8 to make sure we don't cut off a word.
+            prompt = tokenizer.decode(tokenized_prompt[:half], skip_special_tokens=True) + " ... " + \
                      tokenizer.decode(tokenized_prompt[-half:], skip_special_tokens=True)
 
         if dataset not in ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"] and "chat" in model_name.lower():
@@ -127,15 +127,20 @@ def generate_predictions(model, prompts, max_gen, tokenizer):
 
 def predict_dataset(args, model, tokenizer, data, max_length, max_gen, prompt_format, dataset, device, model_name, batch_size=4):
 
-    token_length = max_length
-    if args.pretrained_neurocache:
-        token_length += model.neurocache_config.cache_size
+    token_length = max_length - max_gen
 
     prompts = []
     for json_obj in tqdm(data, desc=f"Preparing inputs for {dataset}"):
         prompt = prepare_prompts(tokenizer, json_obj, token_length, prompt_format, dataset, model_name)
         if prompt is not None:
             prompts.append(prompt)
+
+    if args.pretrained_neurocache:
+        cache_prompts = []
+        for json_obj in tqdm(data, desc=f"Preparing cache inputs for {dataset}"):
+            prompt = prepare_prompts(tokenizer, json_obj, model.neurocache_config.cache_size, prompt_format, dataset, model_name)
+            if prompt is not None:
+                cache_prompts.append(prompt)
 
     # sort prompts by length to reduce padding. in descending order 
     # save indices for resorting later
@@ -144,35 +149,33 @@ def predict_dataset(args, model, tokenizer, data, max_length, max_gen, prompt_fo
 
     # generate predictions in batches
     preds = []
-    input_ids = []
-    attn_masks = []
 
     for i in tqdm(range(0, len(prompts), batch_size), desc=f"Generating predictions for {dataset}"):
-        batch = prompts[i:i + batch_size]
-
         # pad batch. ensure equal batchsize to avoid neurocache reinitialization of cache
+        batch = prompts[i:i + batch_size]
         if i + batch_size > len(prompts):
             batch.extend([batch[-1]] * (batch_size - len(batch)))
 
         prepared_input = tokenizer(batch, padding=True, truncation=True, 
-                                    max_length=(token_length - max_gen), return_tensors="pt").to(device)
+                                    max_length=token_length, return_tensors="pt").to(device)
 
         # prefill cache
         if args.pretrained_neurocache:
-            prepared_input = prefill_neurocache(args, model, prepared_input, max_length - max_gen)
+            cache_batch = cache_prompts[i:i + batch_size]
+            if i + batch_size > len(cache_prompts):
+                cache_batch.extend([cache_batch[-1]] * (batch_size - len(cache_batch)))
+
+            cache_inputs = tokenizer(cache_batch, padding=True, truncation=True,
+                                    max_length=model.neurocache_config.cache_size, return_tensors="pt").to(device)
+
+            prefill_neurocache(args, model, cache_inputs, 0)
             with model.generation_mode():
                 preds.extend(generate_predictions(model, prepared_input, max_gen, tokenizer))
-            import ipdb; ipdb.set_trace()
         else:
             preds.extend(generate_predictions(model, prepared_input, max_gen, tokenizer))
 
-        input_ids.extend(prepared_input["input_ids"].tolist())
-        attn_masks.extend(prepared_input["attention_mask"].tolist())
-
     # resort predictions
     preds = [preds[i] for i in np.argsort(sorted_indices)]
-    input_ids = [input_ids[i] for i in np.argsort(sorted_indices)]
-    attn_masks = [attn_masks[i] for i in np.argsort(sorted_indices)]
 
     json_preds = []
     for i, (json_obj, pred) in enumerate(zip(data, preds)):
@@ -181,8 +184,6 @@ def predict_dataset(args, model, tokenizer, data, max_length, max_gen, prompt_fo
             "answers": json_obj["answers"],
             "all_classes": json_obj["all_classes"],
             "length": json_obj["length"],
-            "input_ids": input_ids[i],
-            "attention_mask": attn_masks[i],
         })
 
     return json_preds
@@ -230,7 +231,8 @@ def main():
     model_name = model_name.replace("/", "_")
 
     for dataset in datasets:
-        dataset_output_dir = os.path.join(output_dir, model_name)
+        dataset_output_dir = os.path.join(output_dir, os.path.basename(args.pretrained_neurocache.strip("/")) if args.pretrained_neurocache else model_name)
+        logging.info(f"Saving predictions to {dataset_output_dir}")
         if not os.path.exists(dataset_output_dir):
             os.makedirs(dataset_output_dir)
 
